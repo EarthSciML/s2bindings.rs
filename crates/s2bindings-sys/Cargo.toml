@@ -1,0 +1,20 @@
+[package]
+name = "s2bindings-sys"
+version = "0.0.0"
+description = "Low-level FFI bindings over the vendored s2geometry C++ geometry engine (build scaffold)."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+# Declares the native library this -sys crate provides, so Cargo links it at
+# most once across the dependency graph (standard -sys crate hygiene).
+links = "s2bindings_shim"
+publish = false
+
+[lib]
+name = "s2bindings_sys"
+
+[build-dependencies]
+cmake = "0.1"

@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = ["crates/s2bindings-sys"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/EarthSciML/s2bindings.rs"
+authors = ["Earth Science and Machine Learning (EarthSciML)"]
+rust-version = "1.74"

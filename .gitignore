@@ -1,0 +1,6 @@
+# Rust build artifacts (kept on scratch, off the inode-tight home FS)
+/target
+**/*.rs.bk
+
+# CMake / C++ scratch that might leak outside target/ during local hacking
+/build

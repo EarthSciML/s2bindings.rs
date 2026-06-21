@@ -1,0 +1,6 @@
+[submodule "crates/s2bindings-sys/vendor/abseil-cpp"]
+	path = crates/s2bindings-sys/vendor/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp.git
+[submodule "crates/s2bindings-sys/vendor/s2geometry"]
+	path = crates/s2bindings-sys/vendor/s2geometry
+	url = https://github.com/google/s2geometry.git

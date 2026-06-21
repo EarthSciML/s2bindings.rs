@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: build + smoke test (ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The s2geometry + abseil C++ sources are vendored as submodules.
+          submodules: recursive
+
+      - name: Install C++ build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Caches the cargo registry AND target/ (which holds the compiled
+      # abseil + s2geometry artifacts), so only the first run pays the full
+      # C++ build cost.
+      - name: Cache cargo + C++ build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build (links the vendored S2 C++ stack)
+        run: cargo build --workspace --verbose
+
+      - name: Smoke test (FFI calls into s2geometry)
+        run: cargo test --workspace --verbose
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
