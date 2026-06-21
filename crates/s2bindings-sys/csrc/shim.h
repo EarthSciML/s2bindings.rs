@@ -105,6 +105,75 @@ s2bindings_polygon *s2bindings_polygon_intersection(const s2bindings_polygon *a,
                                                     char *err_buf,
                                                     size_t err_buf_len);
 
+/* ---- spherical Delaunay / Voronoi connectivity --------------------------- */
+
+/* Opaque handle wrapping a spherical Delaunay triangulation of a set of
+ * generator points, together with the dual Voronoi vertices (the per-triangle
+ * circumcenters). The triangulation is the set of faces of the 3-D convex hull
+ * of the generator points taken as unit vectors -- which, for points on a
+ * sphere, is exactly their Delaunay triangulation. */
+typedef struct s2bindings_delaunay s2bindings_delaunay;
+
+/* Builds the spherical Delaunay triangulation of `n` generator points, given as
+ * parallel latitude/longitude arrays in degrees.
+ *
+ * DETERMINISM CONTRACT (normative -- any binding reproducing this output must
+ * follow it):
+ *   - Generator cells are identified by their input index, 0..n-1.
+ *   - Triangles are the faces of the 3-D convex hull of the generators as unit
+ *     vectors. Every orientation decision is made with s2geometry's robust
+ *     orientation predicate (a double-precision result guarded by a Shewchuk
+ *     static error filter, falling back to ExactFloat arbitrary precision), so
+ *     the triangulation is a deterministic function of the input coordinates --
+ *     independent of insertion order and free of floating-point tie ambiguity.
+ *   - Each triangle is emitted CCW as seen from outside the sphere, rotated so
+ *     its smallest cell index comes first; the triangle list is sorted
+ *     lexicographically by (i, j, k). The Voronoi vertex with index v is the
+ *     circumcenter of triangle v.
+ *   - The contract resolves every input whose generators are not EXACTLY
+ *     cospherically degenerate (four exactly-coplanar points). Coordinates
+ *     produced from lon/lat via trigonometry are never exactly coplanar; an
+ *     exactly-degenerate input is reported as an error rather than resolved by
+ *     an ad-hoc rule.
+ *
+ * Requires n >= 4 generators that are not all coplanar (a 3-D hull needs a
+ * non-degenerate tetrahedron). On success returns a non-null handle and does
+ * not touch `err_buf`. On invalid input (n < 4, non-finite coordinates,
+ * duplicate generators, all generators coplanar, or an exactly-degenerate
+ * configuration) returns NULL; if `err_buf` is non-null and `err_buf_len > 0` a
+ * NUL-terminated human-readable reason is written (truncated to fit). */
+s2bindings_delaunay *s2bindings_delaunay_new(const double *lat_deg,
+                                             const double *lng_deg, size_t n,
+                                             char *err_buf, size_t err_buf_len);
+
+/* Releases a handle returned by s2bindings_delaunay_new. NULL is accepted and
+ * ignored. */
+void s2bindings_delaunay_free(s2bindings_delaunay *d);
+
+/* Number of generator cells (== the `n` passed to s2bindings_delaunay_new), or
+ * 0 for a null handle. */
+int s2bindings_delaunay_num_points(const s2bindings_delaunay *d);
+
+/* Number of Delaunay triangles == number of dual Voronoi vertices. For n
+ * generators this is exactly 2*n - 4 (Euler's formula for a triangulated
+ * sphere). Returns 0 for a null handle. */
+int s2bindings_delaunay_num_triangles(const s2bindings_delaunay *d);
+
+/* Copies the triangles into `out_ijk` as 3 cell indices per triangle (a flat
+ * array of length 3 * num_triangles): out_ijk[3*t+0..2] are the cell indices of
+ * triangle `t`, CCW as seen from outside the sphere and rotated so the smallest
+ * index is first. The caller-provided buffer must have capacity at least
+ * 3 * s2bindings_delaunay_num_triangles(d). Does nothing for a null handle. */
+void s2bindings_delaunay_triangles(const s2bindings_delaunay *d, int *out_ijk);
+
+/* Copies the dual Voronoi vertices (the per-triangle circumcenters, i.e. the
+ * unit points equidistant from each triangle's three generators) into the
+ * caller-provided arrays as latitude/longitude in degrees. Both arrays must
+ * have capacity at least s2bindings_delaunay_num_triangles(d). The circumcenter
+ * of triangle `t` is written at index `t`. Does nothing for a null handle. */
+void s2bindings_delaunay_circumcenters(const s2bindings_delaunay *d,
+                                       double *lat_deg_out, double *lng_deg_out);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

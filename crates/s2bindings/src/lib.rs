@@ -1,6 +1,7 @@
-//! Safe Rust API for **spherical** polygon operations — intersection (clipping)
-//! and area — backed by Google's [s2geometry] C++ engine via the
-//! [`s2bindings-sys`] crate.
+//! Safe Rust API for **spherical** geometry — polygon intersection (clipping)
+//! and area ([`SphericalPolygon`]), plus spherical Delaunay triangulation and
+//! the dual Voronoi connectivity ([`SphericalDelaunay`]) — backed by Google's
+//! [s2geometry] C++ engine via the [`s2bindings-sys`] crate.
 //!
 //! Rust's planar geometry crates treat coordinates as points in the Cartesian
 //! plane, which is wrong for lon/lat data spanning large areas or near the
@@ -57,6 +58,7 @@
 //! [spherely]: https://github.com/benbovy/spherely
 //! [s2]: https://github.com/r-spatial/s2
 
+use std::collections::HashMap;
 use std::fmt;
 use std::os::raw::{c_char, c_int};
 
@@ -269,6 +271,269 @@ impl fmt::Debug for SphericalPolygon {
     }
 }
 
+/// The dual Voronoi connectivity of a [`SphericalDelaunay`], in the array form
+/// used by MPAS-style unstructured meshes.
+///
+/// Both arrays are indexed by generator cell. For cell `c` with `k` neighbours,
+/// `cells_on_cell[c]` and `vertices_on_cell[c]` each have length `k` (MPAS
+/// `nEdgesOnCell`) and share an index: the Voronoi vertex `vertices_on_cell[c][i]`
+/// lies between the edges to `cells_on_cell[c][i]` and `cells_on_cell[c][(i+1) %
+/// k]`. Each consecutive neighbour pair is one Voronoi edge of the cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoronoiConnectivity {
+    /// For each cell, its neighbouring cells (the cells sharing a Voronoi edge,
+    /// equivalently the Delaunay-edge neighbours), counter-clockwise as seen
+    /// from outside the sphere and rotated so the smallest neighbour index is
+    /// first.
+    pub cells_on_cell: Vec<Vec<usize>>,
+    /// For each cell, the surrounding Voronoi vertices (indices into
+    /// [`SphericalDelaunay::vertex_points`]), aligned with `cells_on_cell`:
+    /// `vertices_on_cell[c][i]` is the circumcenter of the Delaunay triangle
+    /// `(c, cells_on_cell[c][i], cells_on_cell[c][(i + 1) % k])`.
+    pub vertices_on_cell: Vec<Vec<usize>>,
+}
+
+/// A spherical **Delaunay triangulation** of a set of generator points, together
+/// with the dual **Voronoi connectivity** — the topology of an MPAS-style
+/// spherical centroidal Voronoi tessellation (SCVT) mesh.
+///
+/// On a sphere the Delaunay triangulation of a point set is exactly the set of
+/// faces of the points' 3-D convex hull (taken as unit vectors), and the dual
+/// Voronoi diagram has one vertex per triangle at that triangle's circumcenter.
+/// This type computes the hull with s2geometry's robust orientation arithmetic
+/// and exposes both the primal triangles and the dual cell connectivity.
+///
+/// Owns a handle on the C++ side and frees it on drop. Not `Send`/`Sync`.
+///
+/// # Determinism contract
+///
+/// The integer connectivity is a deterministic function of the input
+/// coordinates — reproducible byte-for-byte by any binding that follows the same
+/// rules — because:
+///
+/// * Cells are identified by input index, `0..n`.
+/// * Every orientation decision uses an exact predicate (double precision under
+///   a Shewchuk static error filter, falling back to arbitrary-precision
+///   `ExactFloat`), so there is no floating-point tie ambiguity and the hull is
+///   independent of insertion order.
+/// * Triangles are emitted CCW as seen from outside the sphere, each rotated so
+///   its smallest cell index is first, and the list is sorted lexicographically.
+///   The Voronoi vertex with index `v` is the circumcenter of triangle `v`.
+/// * Per-cell neighbour and vertex rings are ordered CCW and rotated to start at
+///   the smallest neighbour index (see [`VoronoiConnectivity`]).
+///
+/// The generators must form a closed global mesh — their convex hull must
+/// enclose the sphere centre, as any SCVT mesh does — and must not be exactly
+/// cospherically degenerate (four exactly-coplanar points). Coordinates derived
+/// from lon/lat via trigonometry are never exactly coplanar; an exactly
+/// degenerate configuration is reported as an [`S2Error`] rather than resolved
+/// by an ad-hoc rule.
+///
+/// # Performance
+///
+/// The hull is built by simple incremental insertion in `O(n²)` time, which is
+/// ample for the seed and intermediate meshes this targets but is not tuned for
+/// very large grids; the exact-arithmetic fallback runs only for the few
+/// orientation tests the floating-point filter cannot settle.
+///
+/// # Example
+///
+/// ```
+/// use s2bindings::SphericalDelaunay;
+///
+/// // Six generators at the axis vertices form a regular octahedron: 8 Delaunay
+/// // triangles (2*6 - 4), and every Voronoi cell is a square (4 neighbours).
+/// let octahedron = [
+///     (0.0, 0.0), (90.0, 0.0), (180.0, 0.0), (-90.0, 0.0), // equator (lon, lat)
+///     (0.0, 90.0), (0.0, -90.0),                           // poles
+/// ];
+/// let mesh = SphericalDelaunay::from_lon_lat(&octahedron)?;
+/// assert_eq!(mesh.num_cells(), 6);
+/// assert_eq!(mesh.num_vertices(), 8);
+///
+/// let conn = mesh.voronoi_connectivity();
+/// assert!(conn.cells_on_cell.iter().all(|nbrs| nbrs.len() == 4));
+/// # Ok::<(), s2bindings::S2Error>(())
+/// ```
+pub struct SphericalDelaunay {
+    handle: *mut sys::s2bindings_delaunay,
+}
+
+impl SphericalDelaunay {
+    /// Builds the spherical Delaunay triangulation of generator points given as
+    /// `(longitude, latitude)` pairs in degrees.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`S2Error`] if there are fewer than 4 generators, any coordinate
+    /// is non-finite, two generators coincide, the generators are all coplanar
+    /// or do not enclose the sphere centre, or the configuration is exactly
+    /// cospherically degenerate (see the [type docs](Self#determinism-contract)).
+    pub fn from_lon_lat(points: &[(f64, f64)]) -> Result<Self, S2Error> {
+        if points.len() < 4 {
+            return Err(S2Error::new(
+                "spherical Delaunay needs at least 4 generator points",
+            ));
+        }
+        // The shim takes parallel latitude / longitude arrays (S2LatLng order),
+        // so split the (lon, lat) input.
+        let lats: Vec<f64> = points.iter().map(|&(_lon, lat)| lat).collect();
+        let lngs: Vec<f64> = points.iter().map(|&(lon, _lat)| lon).collect();
+
+        let mut err = [0 as c_char; ERR_BUF_LEN];
+        // SAFETY: `lats` and `lngs` each hold exactly `points.len()` slots and
+        // outlive the call; `err` is a valid writable buffer of `ERR_BUF_LEN`.
+        let handle = unsafe {
+            sys::s2bindings_delaunay_new(
+                lats.as_ptr(),
+                lngs.as_ptr(),
+                points.len(),
+                err.as_mut_ptr(),
+                ERR_BUF_LEN,
+            )
+        };
+        if handle.is_null() {
+            return Err(S2Error::new(err_buf_to_string(&err)));
+        }
+        Ok(SphericalDelaunay { handle })
+    }
+
+    /// Number of generator cells (the number of points passed to
+    /// [`from_lon_lat`](Self::from_lon_lat)).
+    pub fn num_cells(&self) -> usize {
+        // SAFETY: valid handle; the count is non-negative.
+        let n = unsafe { sys::s2bindings_delaunay_num_points(self.handle) };
+        n.max(0) as usize
+    }
+
+    /// Number of Delaunay triangles, which equals the number of dual Voronoi
+    /// vertices. For `n` generators this is exactly `2 * n - 4`.
+    pub fn num_vertices(&self) -> usize {
+        // SAFETY: valid handle; the count is non-negative.
+        let n = unsafe { sys::s2bindings_delaunay_num_triangles(self.handle) };
+        n.max(0) as usize
+    }
+
+    /// The Delaunay triangles as triples of cell indices, each CCW as seen from
+    /// outside the sphere with its smallest index first, sorted lexicographically
+    /// (see the [determinism contract](Self#determinism-contract)). Triangle `t`
+    /// is dual to the Voronoi vertex at [`vertex_points`](Self::vertex_points)`[t]`.
+    pub fn triangles(&self) -> Vec<[usize; 3]> {
+        let nt = self.num_vertices();
+        let mut buf = vec![0 as c_int; 3 * nt];
+        // SAFETY: `buf` has capacity `3 * nt == 3 * num_triangles`; valid handle.
+        unsafe {
+            sys::s2bindings_delaunay_triangles(self.handle, buf.as_mut_ptr());
+        }
+        buf.chunks_exact(3)
+            .map(|c| [c[0] as usize, c[1] as usize, c[2] as usize])
+            .collect()
+    }
+
+    /// The dual Voronoi vertices (per-triangle circumcenters) as `(longitude,
+    /// latitude)` in degrees. Index `t` is the circumcenter of [triangle
+    /// `t`](Self::triangles).
+    pub fn vertex_points(&self) -> Vec<(f64, f64)> {
+        let nt = self.num_vertices();
+        let mut lat = vec![0.0_f64; nt];
+        let mut lng = vec![0.0_f64; nt];
+        // SAFETY: both buffers have capacity `nt == num_triangles`; valid handle.
+        unsafe {
+            sys::s2bindings_delaunay_circumcenters(self.handle, lat.as_mut_ptr(), lng.as_mut_ptr());
+        }
+        // Re-pair as (lon, lat) for the public convention.
+        lng.into_iter().zip(lat).collect()
+    }
+
+    /// The dual Voronoi connectivity (`cellsOnCell` / `verticesOnCell`), derived
+    /// from the Delaunay triangulation by walking the fan of triangles around
+    /// each cell. See [`VoronoiConnectivity`] for the array layout and the
+    /// [type docs](Self#determinism-contract) for the ordering rules.
+    pub fn voronoi_connectivity(&self) -> VoronoiConnectivity {
+        let n = self.num_cells();
+        let tris = self.triangles();
+
+        // Map each directed Delaunay edge (u -> v) to the unique triangle that
+        // carries it in CCW order, and record one incident triangle per cell as
+        // a fan-walk starting point. On a consistently-oriented closed surface
+        // every directed edge appears exactly once.
+        let mut edge_to_tri: HashMap<(usize, usize), usize> =
+            HashMap::with_capacity(tris.len() * 3);
+        let mut start_tri: Vec<Option<usize>> = vec![None; n];
+        for (ti, t) in tris.iter().enumerate() {
+            let [a, b, c] = *t;
+            edge_to_tri.insert((a, b), ti);
+            edge_to_tri.insert((b, c), ti);
+            edge_to_tri.insert((c, a), ti);
+            for &v in t {
+                start_tri[v].get_or_insert(ti);
+            }
+        }
+
+        let mut cells_on_cell = Vec::with_capacity(n);
+        let mut vertices_on_cell = Vec::with_capacity(n);
+        for (c, &maybe_start) in start_tri.iter().enumerate() {
+            let mut neighbours = Vec::new();
+            let mut vertices = Vec::new();
+            if let Some(start) = maybe_start {
+                let mut t = start;
+                // Walk the fan CCW. Each triangle rotated to [c, x, y] occupies
+                // the wedge from neighbour x to neighbour y; the next triangle
+                // CCW shares the directed edge (c -> y).
+                loop {
+                    let [a, b, cc] = tris[t];
+                    let (x, y) = if a == c {
+                        (b, cc)
+                    } else if b == c {
+                        (cc, a)
+                    } else {
+                        (a, b)
+                    };
+                    neighbours.push(x);
+                    vertices.push(t);
+                    match edge_to_tri.get(&(c, y)) {
+                        Some(&next) if next != start => t = next,
+                        _ => break,
+                    }
+                    // Anti-runaway guard; a valid fan closes within this many steps.
+                    if neighbours.len() > tris.len() {
+                        break;
+                    }
+                }
+                // Rotate both rings (in lock-step, preserving alignment) so the
+                // smallest neighbour index comes first.
+                if let Some(m) = (0..neighbours.len()).min_by_key(|&i| neighbours[i]) {
+                    neighbours.rotate_left(m);
+                    vertices.rotate_left(m);
+                }
+            }
+            cells_on_cell.push(neighbours);
+            vertices_on_cell.push(vertices);
+        }
+        VoronoiConnectivity {
+            cells_on_cell,
+            vertices_on_cell,
+        }
+    }
+}
+
+impl Drop for SphericalDelaunay {
+    fn drop(&mut self) {
+        // SAFETY: `self.handle` came from the shim and has not been freed; the
+        // shim accepts (and ignores) null defensively in any case.
+        unsafe { sys::s2bindings_delaunay_free(self.handle) };
+    }
+}
+
+impl fmt::Debug for SphericalDelaunay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SphericalDelaunay")
+            .field("num_cells", &self.num_cells())
+            .field("num_vertices", &self.num_vertices())
+            .finish()
+    }
+}
+
 /// Reads a NUL-terminated C error message out of a `c_char` buffer.
 fn err_buf_to_string(buf: &[c_char]) -> String {
     let bytes: Vec<u8> = buf
@@ -454,5 +719,251 @@ mod tests {
     fn non_finite_coordinates_are_an_error() {
         let result = SphericalPolygon::from_lon_lat(&[(0.0, 0.0), (f64::NAN, 0.0), (10.0, 10.0)]);
         assert!(result.is_err(), "NaN coordinates should be rejected");
+    }
+
+    // ---- spherical Delaunay / Voronoi connectivity ------------------------
+
+    // The six axis vertices (±x, ±y, ±z), as (lon, lat) degrees.
+    fn octahedron() -> Vec<(f64, f64)> {
+        vec![
+            (0.0, 0.0),
+            (90.0, 0.0),
+            (180.0, 0.0),
+            (-90.0, 0.0),
+            (0.0, 90.0),
+            (0.0, -90.0),
+        ]
+    }
+
+    // The eight cube corners (±1, ±1, ±1)/√3, as (lon, lat) degrees.
+    fn cube() -> Vec<(f64, f64)> {
+        let lat = (1.0_f64 / 2.0_f64.sqrt()).atan().to_degrees(); // ≈ 35.264°
+        let mut pts = Vec::new();
+        for &lon in &[45.0, 135.0, 225.0, 315.0] {
+            pts.push((lon, lat));
+            pts.push((lon, -lat));
+        }
+        pts
+    }
+
+    // The twelve regular-icosahedron vertices (the "12 pentagon seeds"): two
+    // poles plus two offset rings of five, as (lon, lat) degrees.
+    fn icosahedron() -> Vec<(f64, f64)> {
+        let ring = 0.5_f64.atan().to_degrees(); // ≈ 26.565°
+        let mut pts = vec![(0.0, 90.0), (0.0, -90.0)];
+        for k in 0..5 {
+            let lon = 72.0 * k as f64;
+            pts.push((lon, ring));
+            pts.push((lon + 36.0, -ring));
+        }
+        pts
+    }
+
+    // Asserts the structural invariants every closed spherical Delaunay mesh
+    // must satisfy, and returns the connectivity for further checks.
+    fn assert_valid_mesh(mesh: &SphericalDelaunay) -> VoronoiConnectivity {
+        let n = mesh.num_cells();
+        let tris = mesh.triangles();
+
+        // Euler: a triangulated sphere on n vertices has exactly 2n - 4 faces.
+        assert_eq!(mesh.num_vertices(), 2 * n - 4, "triangle count (Euler)");
+        assert_eq!(tris.len(), mesh.num_vertices());
+        assert_eq!(mesh.vertex_points().len(), mesh.num_vertices());
+
+        // Every triangle has 3 distinct, in-range, ascending-first indices.
+        for t in &tris {
+            assert!(t.iter().all(|&v| v < n), "index in range");
+            assert!(t[0] != t[1] && t[1] != t[2] && t[0] != t[2], "distinct");
+            assert!(t[0] < t[1] && t[0] < t[2], "smallest index first: {t:?}");
+        }
+        // The triangle list is sorted and unique (canonical).
+        let mut sorted = tris.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted, tris, "triangles are sorted and unique");
+
+        // Each undirected edge is shared by exactly two triangles (closed mesh):
+        // count directed edges; every (u,v) must have its reverse (v,u).
+        let mut directed: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        for t in &tris {
+            for &(u, v) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                assert!(directed.insert((u, v)), "directed edge appears once");
+            }
+        }
+        for &(u, v) in &directed {
+            assert!(directed.contains(&(v, u)), "edge {u}->{v} has a twin");
+        }
+        // Euler edge count: E = 3n - 6, i.e. 2E = 6n - 12 directed edges.
+        assert_eq!(directed.len(), 6 * n - 12, "directed-edge count (Euler)");
+
+        let conn = mesh.voronoi_connectivity();
+        assert_eq!(conn.cells_on_cell.len(), n);
+        assert_eq!(conn.vertices_on_cell.len(), n);
+
+        let tri_set: std::collections::HashSet<[usize; 3]> = tris.iter().copied().collect();
+        for c in 0..n {
+            let nbrs = &conn.cells_on_cell[c];
+            let verts = &conn.vertices_on_cell[c];
+            let k = nbrs.len();
+            assert!(k >= 3, "cell {c} has degree {k} (>= 3)");
+            assert_eq!(verts.len(), k, "cell {c} ring lengths agree");
+
+            // Normative rotation: smallest neighbour index first.
+            assert_eq!(
+                *nbrs.iter().min().unwrap(),
+                nbrs[0],
+                "cell {c} ring starts at its smallest neighbour"
+            );
+            // No repeated neighbours.
+            let uniq: std::collections::HashSet<usize> = nbrs.iter().copied().collect();
+            assert_eq!(uniq.len(), k, "cell {c} neighbours are distinct");
+
+            // Alignment: vertex i is the triangle (c, nbr[i], nbr[i+1]).
+            for i in 0..k {
+                let j = (i + 1) % k;
+                let mut want = [c, nbrs[i], nbrs[j]];
+                want.sort();
+                let mut got = tris[verts[i]];
+                got.sort();
+                assert_eq!(got, want, "cell {c} vertex {i} aligns with its edge");
+                assert!(tri_set.contains(&tris[verts[i]]));
+            }
+        }
+
+        // Adjacency is symmetric: j is a neighbour of c iff c is a neighbour of j.
+        for c in 0..n {
+            for &j in &conn.cells_on_cell[c] {
+                assert!(
+                    conn.cells_on_cell[j].contains(&c),
+                    "adjacency symmetry {c}<->{j}"
+                );
+            }
+        }
+        conn
+    }
+
+    #[test]
+    fn octahedron_triangulates_into_eight_squares() {
+        let mesh = SphericalDelaunay::from_lon_lat(&octahedron()).unwrap();
+        assert_eq!(mesh.num_cells(), 6);
+        assert_eq!(mesh.num_vertices(), 8);
+        let conn = assert_valid_mesh(&mesh);
+        // Every octahedron cell is a square: 4 neighbours, 4 Voronoi vertices.
+        for nbrs in &conn.cells_on_cell {
+            assert_eq!(nbrs.len(), 4);
+        }
+    }
+
+    #[test]
+    fn icosahedron_twelve_pentagon_seeds() {
+        // The 12 icosahedron vertices each have a pentagonal Voronoi cell — the
+        // canonical "12 pentagon seeds" of an SCVT mesh.
+        let mesh = SphericalDelaunay::from_lon_lat(&icosahedron()).unwrap();
+        assert_eq!(mesh.num_cells(), 12);
+        assert_eq!(mesh.num_vertices(), 20); // 2*12 - 4
+        let conn = assert_valid_mesh(&mesh);
+        for (c, nbrs) in conn.cells_on_cell.iter().enumerate() {
+            assert_eq!(nbrs.len(), 5, "cell {c} should be a pentagon");
+        }
+    }
+
+    #[test]
+    fn cube_resolves_cocircular_faces() {
+        // Each cube face has four cocircular corners — the degenerate case the
+        // exact predicate must resolve deterministically into 2 triangles/face.
+        let mesh = SphericalDelaunay::from_lon_lat(&cube()).unwrap();
+        assert_eq!(mesh.num_cells(), 8);
+        assert_eq!(mesh.num_vertices(), 12); // 2*8 - 4, six faces × 2
+        assert_valid_mesh(&mesh);
+    }
+
+    #[test]
+    fn octahedron_circumcenters_are_octant_centres() {
+        // The 8 octahedron faces are the spherical octants; their circumcenters
+        // are the 8 directions (±1, ±1, ±1)/√3.
+        let mesh = SphericalDelaunay::from_lon_lat(&octahedron()).unwrap();
+        let expected_lat = (1.0_f64 / 2.0_f64.sqrt()).atan().to_degrees(); // ≈35.26°
+        for (lon, lat) in mesh.vertex_points() {
+            assert!(
+                (lat.abs() - expected_lat).abs() < 1e-9,
+                "circumcenter lat {lat} should be ±{expected_lat}"
+            );
+            // Longitude is one of ±45°, ±135°.
+            let near = [45.0, 135.0, -45.0, -135.0]
+                .iter()
+                .any(|&e| (lon - e).abs() < 1e-9);
+            assert!(near, "circumcenter lon {lon} should be a ±45/±135 octant");
+        }
+    }
+
+    #[test]
+    fn triangulation_is_reproducible() {
+        // Identical input must give byte-identical canonical output.
+        let pts = icosahedron();
+        let a = SphericalDelaunay::from_lon_lat(&pts).unwrap();
+        let b = SphericalDelaunay::from_lon_lat(&pts).unwrap();
+        assert_eq!(a.triangles(), b.triangles());
+        assert_eq!(
+            a.voronoi_connectivity().cells_on_cell,
+            b.voronoi_connectivity().cells_on_cell
+        );
+    }
+
+    #[test]
+    fn triangulation_is_independent_of_input_order() {
+        // Cyclically rotating the generator order relabels indices by +k (mod n)
+        // but must yield the same triangulation. Map the rotated result back into
+        // the original labelling and compare the (unordered) triangle sets.
+        let pts = icosahedron();
+        let n = pts.len();
+        let k = 5; // arbitrary rotation
+        let rotated: Vec<(f64, f64)> = (0..n).map(|i| pts[(i + k) % n]).collect();
+
+        let base = SphericalDelaunay::from_lon_lat(&pts).unwrap();
+        let perm = SphericalDelaunay::from_lon_lat(&rotated).unwrap();
+
+        let canon = |tris: Vec<[usize; 3]>, shift: usize| {
+            let mut set: Vec<[usize; 3]> = tris
+                .into_iter()
+                .map(|t| {
+                    let mut m = [(t[0] + shift) % n, (t[1] + shift) % n, (t[2] + shift) % n];
+                    m.sort();
+                    m
+                })
+                .collect();
+            set.sort();
+            set
+        };
+        // perm's local index i is base's index (i + k) % n.
+        assert_eq!(canon(base.triangles(), 0), canon(perm.triangles(), k));
+    }
+
+    #[test]
+    fn delaunay_too_few_points_is_an_error() {
+        let err =
+            SphericalDelaunay::from_lon_lat(&[(0.0, 0.0), (90.0, 0.0), (0.0, 90.0)]).unwrap_err();
+        assert!(!err.message().is_empty());
+    }
+
+    #[test]
+    fn delaunay_duplicate_generators_are_an_error() {
+        // Four points with a coincident pair cannot form a tetrahedron.
+        let pts = [(0.0, 0.0), (0.0, 0.0), (90.0, 0.0), (0.0, 90.0)];
+        assert!(SphericalDelaunay::from_lon_lat(&pts).is_err());
+    }
+
+    #[test]
+    fn delaunay_coplanar_generators_are_an_error() {
+        // Four points on the equator are all coplanar (with the centre): no 3-D
+        // hull, so construction must fail rather than emit garbage.
+        let pts = [(0.0, 0.0), (90.0, 0.0), (180.0, 0.0), (-90.0, 0.0)];
+        assert!(SphericalDelaunay::from_lon_lat(&pts).is_err());
+    }
+
+    #[test]
+    fn delaunay_non_finite_coordinate_is_an_error() {
+        let pts = [(0.0, 0.0), (90.0, 0.0), (0.0, 90.0), (f64::NAN, 0.0)];
+        assert!(SphericalDelaunay::from_lon_lat(&pts).is_err());
     }
 }

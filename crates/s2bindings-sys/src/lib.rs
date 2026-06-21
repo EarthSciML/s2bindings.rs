@@ -131,6 +131,62 @@ extern "C" {
     ) -> *mut s2bindings_polygon;
 }
 
+/// Opaque handle to a spherical Delaunay triangulation (the faces of the 3-D
+/// convex hull of a set of generator points), owned by the C++ side.
+///
+/// Produced by [`s2bindings_delaunay_new`] and released with
+/// [`s2bindings_delaunay_free`]. Same opaque-FFI-type idiom as
+/// [`s2bindings_polygon`].
+#[repr(C)]
+pub struct s2bindings_delaunay {
+    _data: [u8; 0],
+    _marker: core::marker::PhantomData<(*mut u8, core::marker::PhantomPinned)>,
+}
+
+extern "C" {
+    /// Builds the spherical Delaunay triangulation of `n` generator points,
+    /// given as parallel latitude/longitude arrays (degrees) of length `n`.
+    /// Returns null on invalid/degenerate input (n < 4, non-finite, duplicate,
+    /// all-coplanar, or exactly cospherically degenerate), writing a
+    /// NUL-terminated reason into `err_buf` when that buffer is non-null.
+    ///
+    /// See the shim header for the full determinism contract: triangles are the
+    /// faces of the 3-D convex hull, emitted CCW-from-outside, rotated so the
+    /// smallest cell index is first, and sorted lexicographically.
+    pub fn s2bindings_delaunay_new(
+        lat_deg: *const f64,
+        lng_deg: *const f64,
+        n: usize,
+        err_buf: *mut c_char,
+        err_buf_len: usize,
+    ) -> *mut s2bindings_delaunay;
+
+    /// Releases a handle (null is accepted and ignored).
+    pub fn s2bindings_delaunay_free(d: *mut s2bindings_delaunay);
+
+    /// Number of generator cells (== the `n` passed in); `0` for a null handle.
+    pub fn s2bindings_delaunay_num_points(d: *const s2bindings_delaunay) -> c_int;
+
+    /// Number of Delaunay triangles == dual Voronoi vertices (`2*n - 4`); `0`
+    /// for a null handle.
+    pub fn s2bindings_delaunay_num_triangles(d: *const s2bindings_delaunay) -> c_int;
+
+    /// Copies the triangles into `out_ijk` as 3 cell indices per triangle (flat
+    /// array of length `3 * num_triangles`), CCW-from-outside with the smallest
+    /// index first. The buffer must have capacity at least `3 * num_triangles`.
+    pub fn s2bindings_delaunay_triangles(d: *const s2bindings_delaunay, out_ijk: *mut c_int);
+
+    /// Copies the dual Voronoi vertices (per-triangle circumcenters) into the
+    /// caller's `lat_deg_out` / `lng_deg_out` arrays (degrees), each of capacity
+    /// at least `num_triangles`. The circumcenter of triangle `t` is at index
+    /// `t`.
+    pub fn s2bindings_delaunay_circumcenters(
+        d: *const s2bindings_delaunay,
+        lat_deg_out: *mut f64,
+        lng_deg_out: *mut f64,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,5 +238,36 @@ mod tests {
         );
         // SAFETY: `p` is a valid handle; release it.
         unsafe { s2bindings_polygon_free(p) };
+    }
+
+    #[test]
+    fn raw_delaunay_octahedron_has_eight_triangles() {
+        // The six axis vertices (±x, ±y, ±z) form a regular octahedron: their
+        // convex hull has 8 triangular faces, so 2*6 - 4 == 8 Delaunay
+        // triangles / Voronoi vertices.
+        let lat = [0.0_f64, 0.0, 0.0, 0.0, 90.0, -90.0];
+        let lng = [0.0_f64, 90.0, 180.0, -90.0, 0.0, 0.0];
+        // SAFETY: arrays are length 6 and outlive the call; no error buffer.
+        let d = unsafe {
+            s2bindings_delaunay_new(lat.as_ptr(), lng.as_ptr(), 6, std::ptr::null_mut(), 0)
+        };
+        assert!(!d.is_null(), "octahedron generators should triangulate");
+        // SAFETY: `d` is a valid handle.
+        unsafe {
+            assert_eq!(s2bindings_delaunay_num_points(d), 6);
+            assert_eq!(s2bindings_delaunay_num_triangles(d), 8);
+            s2bindings_delaunay_free(d);
+        }
+    }
+
+    #[test]
+    fn raw_delaunay_too_few_points_is_null() {
+        let lat = [0.0_f64, 0.0, 90.0];
+        let lng = [0.0_f64, 90.0, 0.0];
+        // SAFETY: arrays length 3 and outlive the call; no error buffer.
+        let d = unsafe {
+            s2bindings_delaunay_new(lat.as_ptr(), lng.as_ptr(), 3, std::ptr::null_mut(), 0)
+        };
+        assert!(d.is_null(), "fewer than 4 generators must be rejected");
     }
 }
