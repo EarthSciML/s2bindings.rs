@@ -2,17 +2,25 @@
 //!
 //! This crate links Google's [s2geometry] spherical-geometry engine (built from
 //! vendored `abseil-cpp` + `s2geometry` submodules via a CMake superbuild) into
-//! Rust. At this **scaffold** stage it deliberately exposes only a trivial
-//! identity / smoke surface, whose sole purpose is to prove that the C++ stack
-//! compiles, links, and is callable from Rust.
+//! Rust and exposes the raw C ABI of the shim in `csrc/`.
 //!
-//! The spherical geometry kernel itself -- `intersect_polygon`
-//! (`S2Polygon::InitToIntersection`) and spherical area (`S2Polygon::GetArea`)
-//! plus safe wrappers -- lands in a follow-up that builds on this scaffold.
+//! Two surfaces are declared here:
+//!
+//! * a trivial identity / smoke surface ([`s2_max_level`], [`unit_point_norm`])
+//!   that proves the C++ stack compiles, links, and is callable; and
+//! * the raw spherical-geometry kernel ([`s2bindings_polygon_new`],
+//!   [`s2bindings_polygon_intersection`], [`s2bindings_polygon_area`], and the
+//!   loop accessors) over [`s2bindings_polygon`] handles.
+//!
+//! As a `-sys` crate the kernel functions are exposed exactly as the C ABI
+//! presents them: `unsafe`, pointer-based, and without lifetime tracking. The
+//! safe, idiomatic Rust API (a `SphericalPolygon` newtype with `(lon, lat)`
+//! conversion, RAII, and `Result`-based error handling) lives in the companion
+//! `s2bindings` crate, which is what downstream code should depend on.
 //!
 //! [s2geometry]: https://github.com/google/s2geometry
 
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int};
 
 extern "C" {
     /// Returns `S2CellId::kMaxLevel` (== 30) from the linked C++ library.
@@ -45,6 +53,84 @@ pub fn unit_point_norm(lat_deg: f64, lng_deg: f64) -> f64 {
     unsafe { s2bindings_unit_point_norm(lat_deg, lng_deg) }
 }
 
+/// Opaque handle to a heap-allocated `S2Polygon`, owned by the C++ side.
+///
+/// Values are produced by [`s2bindings_polygon_new`] /
+/// [`s2bindings_polygon_intersection`] and must be released with
+/// [`s2bindings_polygon_free`]. The zero-sized, non-constructible body follows
+/// the standard opaque-FFI-type idiom: it can only be referred to behind a
+/// pointer, never instantiated or dereferenced from Rust.
+#[repr(C)]
+pub struct s2bindings_polygon {
+    _data: [u8; 0],
+    // Mark as `!Send`/`!Sync` and non-constructible outside this crate.
+    _marker: core::marker::PhantomData<(*mut u8, core::marker::PhantomPinned)>,
+}
+
+extern "C" {
+    /// Builds a polygon from a single great-circle loop given as parallel
+    /// latitude/longitude arrays (degrees) of length `n`. Returns null on
+    /// invalid/degenerate input, writing a NUL-terminated reason into
+    /// `err_buf` (capacity `err_buf_len`) when that buffer is non-null.
+    ///
+    /// The loop must not repeat its first vertex; it is normalized so the
+    /// enclosed area is at most a hemisphere.
+    pub fn s2bindings_polygon_new(
+        lat_deg: *const f64,
+        lng_deg: *const f64,
+        n: usize,
+        err_buf: *mut c_char,
+        err_buf_len: usize,
+    ) -> *mut s2bindings_polygon;
+
+    /// Releases a handle (null is accepted and ignored).
+    pub fn s2bindings_polygon_free(p: *mut s2bindings_polygon);
+
+    /// Area enclosed by the polygon in steradians (unit sphere), range
+    /// `[0, 4*pi]`; `0.0` for an empty polygon or null handle.
+    pub fn s2bindings_polygon_area(p: *const s2bindings_polygon) -> f64;
+
+    /// Returns `1` if the polygon encloses no area, `0` otherwise.
+    pub fn s2bindings_polygon_is_empty(p: *const s2bindings_polygon) -> c_int;
+
+    /// Number of loops (0 for empty, 1 for a simple polygon, more with holes
+    /// or disjoint pieces).
+    pub fn s2bindings_polygon_num_loops(p: *const s2bindings_polygon) -> c_int;
+
+    /// Vertex count of loop `loop_index`, or `-1` if the index is out of range.
+    pub fn s2bindings_polygon_loop_num_vertices(
+        p: *const s2bindings_polygon,
+        loop_index: c_int,
+    ) -> c_int;
+
+    /// `1` if loop `loop_index` bounds a hole, `0` if a shell, `-1` if the
+    /// index is out of range.
+    pub fn s2bindings_polygon_loop_is_hole(
+        p: *const s2bindings_polygon,
+        loop_index: c_int,
+    ) -> c_int;
+
+    /// Copies loop `loop_index`'s vertices into the caller's `lat_deg_out` /
+    /// `lng_deg_out` arrays (degrees), each of capacity at least
+    /// [`s2bindings_polygon_loop_num_vertices`]. The loop is not closed.
+    pub fn s2bindings_polygon_loop_vertices(
+        p: *const s2bindings_polygon,
+        loop_index: c_int,
+        lat_deg_out: *mut f64,
+        lng_deg_out: *mut f64,
+    );
+
+    /// Intersection (great-circle clip) of `a` and `b`, snapped at S2's default
+    /// intersection merge radius. Returns a new owned handle (possibly empty),
+    /// or null on internal failure (writing a reason into `err_buf`).
+    pub fn s2bindings_polygon_intersection(
+        a: *const s2bindings_polygon,
+        b: *const s2bindings_polygon,
+        err_buf: *mut c_char,
+        err_buf_len: usize,
+    ) -> *mut s2bindings_polygon;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +161,26 @@ mod tests {
                 "unit-vector norm for ({lat}, {lng}) was {n}, expected ~1.0"
             );
         }
+    }
+
+    #[test]
+    fn raw_polygon_roundtrip_area_and_free() {
+        // A spherical octant — vertices at (0,0), (0,90), (90,0) in lat/lng —
+        // encloses exactly 1/8 of the sphere: 4*pi / 8 = pi/2 steradians.
+        let lat = [0.0_f64, 0.0, 90.0];
+        let lng = [0.0_f64, 90.0, 0.0];
+        // SAFETY: arrays are length 3 and outlive the call; no error buffer.
+        let p = unsafe {
+            s2bindings_polygon_new(lat.as_ptr(), lng.as_ptr(), 3, std::ptr::null_mut(), 0)
+        };
+        assert!(!p.is_null(), "octant should be a valid loop");
+        // SAFETY: `p` is a valid handle.
+        let area = unsafe { s2bindings_polygon_area(p) };
+        assert!(
+            (area - std::f64::consts::FRAC_PI_2).abs() < 1e-9,
+            "octant area was {area}, expected pi/2"
+        );
+        // SAFETY: `p` is a valid handle; release it.
+        unsafe { s2bindings_polygon_free(p) };
     }
 }

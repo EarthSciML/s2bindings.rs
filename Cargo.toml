@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/s2bindings-sys"]
+members = ["crates/s2bindings-sys", "crates/s2bindings"]
 
 [workspace.package]
 edition = "2021"

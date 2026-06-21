@@ -1,7 +1,7 @@
 [package]
 name = "s2bindings-sys"
-version = "0.0.0"
-description = "Low-level FFI bindings over the vendored s2geometry C++ geometry engine (build scaffold)."
+version = "0.1.0"
+description = "Low-level FFI bindings over the vendored s2geometry C++ geometry engine."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

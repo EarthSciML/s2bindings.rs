@@ -1,0 +1,15 @@
+[package]
+name = "s2bindings"
+version = "0.1.0"
+description = "Safe Rust API for spherical polygon intersection and area, backed by Google's s2geometry."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Path dependency on the low-level FFI crate. Distribution is via git/tag pin
+# (see README), so no crates.io version requirement is needed; s2bindings-sys
+# is `publish = false`.
+s2bindings-sys = { path = "../s2bindings-sys" }
