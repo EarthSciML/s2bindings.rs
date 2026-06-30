@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>s2bindings · WebAssembly demo</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font: 15px/1.5 system-ui, sans-serif;
+        max-width: 900px;
+        margin: 2rem auto;
+        padding: 0 1rem;
+      }
+      h1 { font-size: 1.4rem; }
+      canvas {
+        width: 100%;
+        height: auto;
+        border: 1px solid #8888;
+        background: #0b1021;
+        border-radius: 6px;
+      }
+      pre {
+        background: #8881;
+        padding: 0.75rem 1rem;
+        border-radius: 6px;
+        overflow-x: auto;
+      }
+      .row { display: flex; gap: 2rem; flex-wrap: wrap; align-items: flex-start; }
+      .col { flex: 1 1 360px; }
+      code { background: #8882; padding: 0 0.25em; border-radius: 3px; }
+      .muted { opacity: 0.7; }
+    </style>
+  </head>
+  <body>
+    <h1>s2bindings — spherical geometry in the browser</h1>
+    <p class="muted">
+      Google's <a href="https://github.com/google/s2geometry">s2geometry</a> C++
+      engine, compiled to WebAssembly via Emscripten. Coordinates are
+      <code>(longitude, latitude)</code> in degrees.
+    </p>
+
+    <div class="row">
+      <div class="col">
+        <h2>Kernel checks</h2>
+        <pre id="out">loading WebAssembly module…</pre>
+      </div>
+      <div class="col">
+        <h2>Spherical Delaunay / Voronoi</h2>
+        <p class="muted">
+          Random points (●), their Delaunay triangulation (lines) and the dual
+          Voronoi vertices / circumcenters (✕), on an equirectangular projection.
+        </p>
+        <canvas id="map" width="720" height="360"></canvas>
+      </div>
+    </div>
+
+    <script type="module">
+      import { load } from "../dist/s2bindings.mjs";
+
+      const out = document.getElementById("out");
+      const log = (s) => (out.textContent += s + "\n");
+
+      try {
+        const s2 = await load();
+        out.textContent = "";
+        log(`S2 max cell level: ${s2.maxLevel()}`);
+
+        // Area of a spherical octant — should be π/2 steradians.
+        const octant = s2.SphericalPolygon.fromLonLat([[0, 0], [90, 0], [0, 90]]);
+        log(`Octant area:       ${octant.area().toFixed(6)} sr  (π/2 = ${(Math.PI / 2).toFixed(6)})`);
+        log(`Octant on Earth:   ${(octant.areaOnSphere() / 1e6).toExponential(3)} km²`);
+
+        // Great-circle intersection of two overlapping octants.
+        const b = s2.SphericalPolygon.fromLonLat([[45, 0], [135, 0], [45, 90]]);
+        const clip = octant.intersection(b);
+        log(`Clip non-empty:    ${!clip.isEmpty()}  (area ${clip.area().toFixed(6)} sr)`);
+        for (const ring of clip.rings()) {
+          const n = ring.vertices.length / 2;
+          log(`  ring: ${n} verts, hole=${ring.isHole}`);
+        }
+        octant.free(); b.free(); clip.free();
+
+        // --- Spherical Delaunay of random points, drawn on a canvas. ---------
+        const N = 24;
+        const coords = [];
+        for (let i = 0; i < N; i++) {
+          const lon = Math.random() * 360 - 180;
+          // area-uniform latitude (avoid pole clustering)
+          const lat = (Math.asin(Math.random() * 2 - 1) * 180) / Math.PI;
+          coords.push([lon, lat]);
+        }
+        const d = s2.Delaunay.fromLonLat(coords);
+        log(`\nDelaunay: ${d.numPoints()} points → ${d.numTriangles()} triangles`);
+
+        drawMap(coords, d.triangles(), d.circumcenters());
+        d.free();
+      } catch (err) {
+        log("ERROR: " + err.message);
+        console.error(err);
+      }
+
+      function drawMap(coords, tris, circ) {
+        const cv = document.getElementById("map");
+        const ctx = cv.getContext("2d");
+        const W = cv.width, H = cv.height;
+        const X = (lon) => ((lon + 180) / 360) * W;
+        const Y = (lat) => ((90 - lat) / 180) * H;
+        ctx.clearRect(0, 0, W, H);
+
+        // Delaunay edges.
+        ctx.strokeStyle = "#5fa8ff";
+        ctx.lineWidth = 1;
+        ctx.globalAlpha = 0.7;
+        for (let t = 0; t < tris.length; t += 3) {
+          const p = [coords[tris[t]], coords[tris[t + 1]], coords[tris[t + 2]]];
+          ctx.beginPath();
+          ctx.moveTo(X(p[0][0]), Y(p[0][1]));
+          ctx.lineTo(X(p[1][0]), Y(p[1][1]));
+          ctx.lineTo(X(p[2][0]), Y(p[2][1]));
+          ctx.closePath();
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1;
+
+        // Voronoi vertices (circumcenters).
+        ctx.strokeStyle = "#ffd166";
+        for (let i = 0; i < circ.length; i += 2) {
+          const x = X(circ[i]), y = Y(circ[i + 1]);
+          ctx.beginPath();
+          ctx.moveTo(x - 3, y - 3); ctx.lineTo(x + 3, y + 3);
+          ctx.moveTo(x + 3, y - 3); ctx.lineTo(x - 3, y + 3);
+          ctx.stroke();
+        }
+
+        // Generator points.
+        ctx.fillStyle = "#ff5d8f";
+        for (const [lon, lat] of coords) {
+          ctx.beginPath();
+          ctx.arc(X(lon), Y(lat), 3.5, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+      }
+    </script>
+  </body>
+</html>

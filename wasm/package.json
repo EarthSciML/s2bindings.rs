@@ -1,0 +1,49 @@
+{
+  "name": "@earthsciml/s2bindings",
+  "version": "0.1.0",
+  "description": "Spherical polygon area + great-circle intersection and spherical Delaunay/Voronoi in the browser, via Google's s2geometry compiled to WebAssembly.",
+  "type": "module",
+  "main": "./dist/s2bindings.mjs",
+  "module": "./dist/s2bindings.mjs",
+  "types": "./dist/s2bindings.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/s2bindings.d.ts",
+      "import": "./dist/s2bindings.mjs"
+    },
+    "./core": "./dist/s2bindings.core.mjs",
+    "./wasm": "./dist/s2bindings.core.wasm"
+  },
+  "files": [
+    "dist/",
+    "src/",
+    "build.sh",
+    "scripts/"
+  ],
+  "scripts": {
+    "build": "bash build.sh",
+    "test": "node test/smoke.mjs"
+  },
+  "sideEffects": [
+    "./dist/s2bindings.core.mjs"
+  ],
+  "keywords": [
+    "s2geometry",
+    "spherical",
+    "geometry",
+    "geospatial",
+    "delaunay",
+    "voronoi",
+    "webassembly",
+    "wasm"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EarthSciML/s2bindings.rs",
+    "directory": "wasm"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

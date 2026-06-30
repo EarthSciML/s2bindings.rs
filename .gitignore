@@ -4,3 +4,11 @@
 
 # CMake / C++ scratch that might leak outside target/ during local hacking
 /build
+
+# WebAssembly build artifacts (reproducible via wasm/build.sh; built in CI).
+# .cache holds the vendored OpenSSL source + wasm libcrypto; .build is the
+# emcmake tree; dist holds the generated module. node_modules from local dev.
+/wasm/.cache/
+/wasm/.build/
+/wasm/dist/
+/wasm/node_modules/

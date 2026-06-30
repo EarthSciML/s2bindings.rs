@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>s2bindings browser test</title>
+  </head>
+  <body>
+    <pre id="log">running…</pre>
+    <script type="module">
+      // Deterministic in-browser test. Exposes window.__s2result for automation.
+      const log = [];
+      const result = { ok: true, passed: 0, log };
+      const check = (cond, label) => {
+        if (cond) {
+          result.passed++;
+          log.push("ok " + label);
+        } else {
+          result.ok = false;
+          log.push("FAIL " + label);
+        }
+      };
+      try {
+        const { load } = await import("../dist/s2bindings.mjs");
+        const s2 = await load();
+
+        check(s2.maxLevel() === 30, "maxLevel == 30");
+
+        const octant = s2.SphericalPolygon.fromLonLat([[0, 0], [90, 0], [0, 90]]);
+        check(Math.abs(octant.area() - Math.PI / 2) < 1e-9, "octant area == pi/2");
+
+        const b = s2.SphericalPolygon.fromLonLat([[45, 0], [135, 0], [45, 90]]);
+        const clip = octant.intersection(b);
+        check(!clip.isEmpty() && clip.area() > 0, "intersection non-empty");
+
+        const d = s2.Delaunay.fromLonLat([
+          [0, 0], [90, 0], [180, 0], [-90, 0], [0, 90], [0, -90],
+        ]);
+        check(d.numTriangles() === 8, "octahedron has 8 triangles");
+        check(d.triangles().length === 24, "24 triangle indices");
+
+        let threw = false;
+        try { s2.SphericalPolygon.fromLonLat([[0, 0], [1, 1]]); } catch { threw = true; }
+        check(threw, "invalid polygon throws");
+
+        for (const h of [octant, b, clip, d]) h.free();
+      } catch (err) {
+        result.ok = false;
+        log.push("EXCEPTION " + (err && err.message ? err.message : err));
+      }
+      result.summary = `${result.passed} checks, ${result.ok ? "ALL PASS" : "FAILURES"}`;
+      window.__s2result = result;
+      document.getElementById("log").textContent = result.summary + "\n" + log.join("\n");
+    </script>
+  </body>
+</html>

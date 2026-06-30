@@ -51,3 +51,32 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets
+
+  wasm:
+    name: wasm build + smoke test (emscripten)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Emscripten SDK
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 6.0.1
+          # Cache the emsdk install across runs.
+          actions-cache-folder: emsdk-cache
+
+      # The wasm libcrypto (OpenSSL/BIGNUM) cross-build is the slow part; cache
+      # it on the build script so it is reused until the recipe changes.
+      - name: Cache wasm OpenSSL build
+        uses: actions/cache@v4
+        with:
+          path: wasm/.cache
+          key: wasm-openssl-${{ runner.os }}-${{ hashFiles('wasm/scripts/build-openssl.sh') }}
+
+      - name: Build the wasm module
+        run: bash wasm/build.sh
+
+      - name: Smoke test (Node loads the wasm module)
+        run: node wasm/test/smoke.mjs

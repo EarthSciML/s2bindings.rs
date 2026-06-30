@@ -98,6 +98,25 @@ that guarantees a topologically valid result while keeping vertices essentially
 exact. Intersecting disjoint polygons, or polygons that only touch along an edge
 or at a vertex, yields an **empty** result (`is_empty()` is `true`).
 
+## Running in the browser (WebAssembly)
+
+The same s2geometry kernel compiles to **WebAssembly** via Emscripten, with a
+small JavaScript/TypeScript wrapper exposing `SphericalPolygon` and `Delaunay`
+classes — so spherical area, great-circle intersection, and spherical
+Delaunay/Voronoi run client-side in the browser (and in Node).
+
+```js
+import { load } from "./wasm/dist/s2bindings.mjs";
+const s2 = await load();
+const a = s2.SphericalPolygon.fromLonLat([[0, 0], [90, 0], [0, 90]]);
+a.area(); // π/2 steradians
+```
+
+Build it with `bash wasm/build.sh` (needs the Emscripten SDK on `PATH`). See
+[`wasm/README.md`](wasm/README.md) for the full API, the build/verify steps, and
+how the C++ → wasm build is wired (it cross-compiles a static OpenSSL `libcrypto`
+for s2geometry's `ExactFloat`). The CI `wasm` job builds and smoke-tests it.
+
 ## How the native build works
 
 `s2bindings-sys` links the C++ stack via a CMake **superbuild** invoked from
