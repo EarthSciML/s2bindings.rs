@@ -91,7 +91,12 @@ cp libcrypto.a libssl.a "$PREFIX/lib/"
 cp -R include/openssl "$PREFIX/include/"
 
 # Sanity check: BIGNUM must actually be in the archive we just built.
-if ! emar t "$PREFIX/lib/libcrypto.a" | grep -q '^bn_'; then
+# List the members into a variable first rather than piping straight into
+# `grep -q`: grep closes the pipe on its first match, and Linux's llvm-ar then
+# aborts with "IO failure on output stream: Broken pipe", which `set -o pipefail`
+# would surface as a spurious "BIGNUM missing" (macOS llvm-ar ignores it).
+crypto_members="$(emar t "$PREFIX/lib/libcrypto.a")"
+if ! grep -q '^bn_' <<<"$crypto_members"; then
   echo "[openssl] error: libcrypto.a has no bn_*.o objects (BIGNUM missing)" >&2
   exit 1
 fi
